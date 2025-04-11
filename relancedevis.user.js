@@ -138,7 +138,7 @@
                 PrixRemise: totalDiscountPriceSum,
                 Produits: allProductNames.join(', '),
                 // Format image URL for Google Sheets
-                Image: firstProductIcon ? `=IMAGE("${firstProductIcon}")` : '',
+                Image: firstProductIcon, // ? `=IMAGE("${firstProductIcon}")` : '',
                 Vendeur: vendeurId || ''
             };
             sendDataToSheet(structuredData);
