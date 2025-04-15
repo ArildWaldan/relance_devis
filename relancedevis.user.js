@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Sur-mesure Scraper
 // @namespace    http://tampermonkey.net/
-// @version      5.0
-// @description  Intercepts Quotation & CAFR requests. Captures token from CAFR, uses polling to trigger customer detail fetch after Quotation, sends data (with IMAGE formula) to Sheet.
+// @version      5.1
+// @description  Intercepts Quotation & CAFR requests. Captures token from CAFR, uses polling to trigger customer detail fetch after Quotation, sends data (with IMAGE formula) to Sheet, shows success popup.
 // @match        https://squareclock-internal-sqc-production.k8s.ap.digikfplc.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
+// @grant        GM_addStyle
 // @grant        unsafeWindow
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
@@ -38,6 +39,67 @@
     let isProcessingCafr = false; // Flag to prevent multiple simultaneous CAFR calls by the poller
     const POLLING_INTERVAL_MS = 500; // Check every 500ms
     let pollingIntervalId = null;
+    let successPopupTimeoutId = null; // To manage the popup timer
+
+    // --- CSS Styling for Success Popup ---
+    GM_addStyle(`
+        #gm-scraper-success-popup {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background-color: #dff0d8; /* Light green background */
+            color: #3c763d; /* Dark green text */
+            border: 1px solid #d6e9c6; /* Slightly darker border */
+            padding: 12px 18px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            z-index: 99999; /* Ensure it's on top */
+            font-family: sans-serif;
+            font-size: 18px;
+            opacity: 0; /* Start hidden */
+            visibility: hidden;
+            transition: opacity 0.4s ease-in-out, visibility 0.4s ease-in-out;
+        }
+        #gm-scraper-success-popup.visible {
+            opacity: 1;
+            visibility: visible;
+        }
+    `);
+
+    // --- Success Notification Popup Logic ---
+    function showSuccessPopup(message, duration = 6000) {
+        // Remove existing popup and clear its timer if present
+        const existingPopup = document.getElementById('gm-scraper-success-popup');
+        if (existingPopup) {
+            existingPopup.remove();
+        }
+        if (successPopupTimeoutId) {
+            clearTimeout(successPopupTimeoutId);
+        }
+
+        // Create new popup element
+        const popup = document.createElement('div');
+        popup.id = 'gm-scraper-success-popup';
+        popup.textContent = message;
+        document.body.appendChild(popup);
+
+        // Trigger fade-in (slight delay ensures transition applies)
+        setTimeout(() => {
+            popup.classList.add('visible');
+        }, 10); // Small delay
+
+        // Set timer to fade-out and remove
+        successPopupTimeoutId = setTimeout(() => {
+            popup.classList.remove('visible');
+            // Remove the element after the fade-out transition completes
+            setTimeout(() => {
+                if (document.getElementById('gm-scraper-success-popup') === popup) {
+                     popup.remove();
+                }
+            }, 400); // Must match the transition duration in CSS
+        }, duration);
+    }
+
 
     // --- Google Sheet Communication ---
     function sendDataToSheet(payload) {
@@ -68,7 +130,10 @@
                     const respData = JSON.parse(responseText);
                     if (response.status === 200 && respData.status === 'success') {
                         console.log(`[${SCRIPT_NAME}] Successfully sent data to Google Sheet.`);
-                        GM_notification({ title: SCRIPT_NAME, text: `Data sent successfully for ${payload.NomClient || 'N/A'}`, timeout: 4000 });
+                        // *** SHOW THE SUCCESS POPUP HERE ***
+                        showSuccessPopup("Devis bien envoyé à l'application de relance");
+                        // Optional: Keep GM_notification as a backup or for more detailed info?
+                        // GM_notification({ title: SCRIPT_NAME, text: `Data sent successfully for ${payload.NomClient || 'N/A'}`, timeout: 4000 });
                     } else {
                         console.error(`[${SCRIPT_NAME}] Error sending data. Status: ${response.status}. Response:`, respData.message || response.responseText);
                         GM_notification({ title: SCRIPT_NAME + " Error", text: `Sheet Error: ${respData.message || 'Check console.'}`, timeout: 10000 });
@@ -137,11 +202,11 @@
                 PrixTTC: quotationData?.totalPV ?? null,
                 PrixRemise: totalDiscountPriceSum,
                 Produits: allProductNames.join(', '),
-                // Format image URL for Google Sheets
-                Image: firstProductIcon, // ? `=IMAGE("${firstProductIcon}")` : '',
+                // Keep image URL simple, let Sheets handle =IMAGE()
+                Image: firstProductIcon,
                 Vendeur: vendeurId || ''
             };
-            sendDataToSheet(structuredData);
+            sendDataToSheet(structuredData); // This function now triggers the popup on success
         } catch(e) {
              console.error(`[${SCRIPT_NAME}] Error during final data structuring or sending:`, e);
              GM_notification({ title: SCRIPT_NAME + " Error", text: "Error structuring data. Check console.", timeout: 6000 });
@@ -202,9 +267,7 @@
                          if (response.status === 401 || response.status === 403) {
                              console.error(`[${SCRIPT_NAME}] Authentication Error (${response.status}) fetching CAFR (poll). Captured Token might be invalid/expired. Resp:`, response.responseText);
                              GM_notification({ title: SCRIPT_NAME + " CAFR Auth Error", text: `Auth Error ${response.status} (poll). Check token/console.`, timeout: 10000 });
-                             // Consider clearing latestAuthToken here? Might cause issues if token source was temporary.
-                             // latestAuthToken = null;
-                        } else {
+                         } else {
                             console.error(`[${SCRIPT_NAME}] Error fetching CAFR details (poll - onload). Status: ${response.status}. Resp:`, response.responseText);
                              GM_notification({ title: SCRIPT_NAME + " CAFR Error", text: `Error ${response.status} fetching CAFR (poll). Partial sent. Check console.`, timeout: 10000 });
                         }
@@ -335,7 +398,7 @@
             const jsonData = JSON.parse(text);
             processQuotationResponse(jsonData); // Stores data for poller
         } catch (err) {
-             const errorText = await response.clone().text();
+             const errorText = await response.clone().text(); // Use clone here too
              if (err instanceof SyntaxError) {
                  console.error(`[${SCRIPT_NAME}] Quotation Response (${url}) is not valid JSON. Snippet:`, errorText.substring(0, 500), err);
              } else {
@@ -352,7 +415,7 @@
 
         // --- Token Capture Logic (Fetch) ---
         if (target && target.name === API_TYPES.CAFR) {
-            console.log(`[${SCRIPT_NAME}] Detected page's ${target.name} fetch request (for token capture):`, url);
+            //console.log(`[${SCRIPT_NAME}] Detected page's ${target.name} fetch request (for token capture):`, url); // Can be noisy
             try {
                 let headers = init?.headers;
                 let currentToken = null;
@@ -360,7 +423,6 @@
                     if (headers instanceof Headers) {
                         currentToken = headers.get('Authorization');
                     } else if (typeof headers === 'object') {
-                        // Find Authorization header case-insensitively
                         const authKey = Object.keys(headers).find(k => k.toLowerCase() === 'authorization');
                         if (authKey) currentToken = headers[authKey];
                     }
@@ -372,9 +434,6 @@
                     }
                 } else if (currentToken) {
                     console.warn(`[${SCRIPT_NAME}] Found Authorization header in CAFR fetch, but it doesn't start with 'Bearer '.`, currentToken.substring(0, 15)+"...");
-                } else {
-                     // It's okay if some CAFR calls don't have it initially
-                    // console.warn(`[${SCRIPT_NAME}] CAFR fetch request detected, but 'Authorization' header not found or empty.`);
                 }
             } catch (e) {
                 console.error(`[${SCRIPT_NAME}] Error extracting headers from CAFR fetch init:`, e);
@@ -391,8 +450,9 @@
         // --- Quotation Response Handling (Fetch) ---
         if (target && target.name === API_TYPES.QUOTATION) {
             promise.then(response => {
-                 (async () => { await parseAndProcessQuotationResponse(response.clone()); })(); // Use clone
-                 return response; // Return original response
+                 const responseClone = response.clone(); // Clone it *once* here
+                 (async () => { await parseAndProcessQuotationResponse(responseClone); })();
+                 return response; // Return original response to the page
             }).catch(error => {
                 console.error(`[${SCRIPT_NAME}] Network/Fetch Error intercepting ${target.name} (${url}):`, error);
             });
@@ -407,6 +467,10 @@
     const originalXhrSend = unsafeWindow.XMLHttpRequest.prototype.send;
     const originalSetRequestHeader = unsafeWindow.XMLHttpRequest.prototype.setRequestHeader;
 
+    // Store the original request header function per instance if needed
+    // (though applying globally is usually fine for this purpose)
+    // unsafeWindow.XMLHttpRequest.prototype._originalSetRequestHeader = originalSetRequestHeader;
+
     // Intercept setRequestHeader for Token Capture
     unsafeWindow.XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
         // Check if it's a CAFR request (target identified in 'open') and the Authorization header
@@ -420,7 +484,7 @@
                  console.warn(`[${SCRIPT_NAME}] Found Authorization header in CAFR XHR, but doesn't start with 'Bearer '.`, value.substring(0, 15)+"...");
              }
         }
-        // Always call the original method
+        // Always call the original method using apply to maintain context
         originalSetRequestHeader.apply(this, arguments);
     };
 
@@ -429,7 +493,11 @@
         this._requestURL = url;
         this._target = getTargetMatch(url); // Identify if it's CAFR or Quotation
         if (this._target) {
-            console.log(`[${SCRIPT_NAME}] Detected page's ${this._target.name} XHR request (open):`, url);
+             if (this._target.name === API_TYPES.QUOTATION) {
+                console.log(`[${SCRIPT_NAME}] Detected page's ${this._target.name} XHR request (open):`, url);
+            } // else { // Can log CAFR open too, but might be noisy
+              // console.log(`[${SCRIPT_NAME}] Detected page's ${this._target.name} XHR request (open - for token):`, url);
+            // }
         }
         originalXhrOpen.apply(this, arguments);
     };
@@ -437,34 +505,63 @@
     // Intercept send to attach Quotation response handler
     unsafeWindow.XMLHttpRequest.prototype.send = function() {
         const xhr = this;
-        const originalOnReadyStateChange = xhr.onreadystatechange;
 
-        if (xhr._target && xhr._target.name === API_TYPES.QUOTATION) {
-            xhr.onreadystatechange = function() {
+        // Only attach listener if it's a Quotation request and we haven't already attached one
+        if (xhr._target && xhr._target.name === API_TYPES.QUOTATION && !xhr._hasScraperListener) {
+             const originalOnReadyStateChange = xhr.onreadystatechange;
+             xhr._hasScraperListener = true; // Mark that we've added our listener
+
+             xhr.onreadystatechange = function() {
+                // Process only when request is complete (readyState 4) and it's our target
                 if (xhr.readyState === 4 && xhr._target && xhr._target.name === API_TYPES.QUOTATION) {
-                     const simulatedResponse = { // Create fetch-like response
-                        ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, statusText: xhr.statusText,
-                        url: xhr.responseURL || xhr._requestURL, text: async () => xhr.responseText,
-                        clone: function() { return { ...this }; }
+                     // Create a fetch-like response object for consistency
+                     const simulatedResponse = {
+                        ok: xhr.status >= 200 && xhr.status < 300,
+                        status: xhr.status,
+                        statusText: xhr.statusText,
+                        url: xhr.responseURL || xhr._requestURL, // Use responseURL if available
+                        text: async () => xhr.responseText, // Make text() async like fetch
+                        // Simple clone for our purposes (doesn't need full stream cloning)
+                        clone: function() {
+                            // Return a new object with the same properties
+                            // Important: text() needs to be callable again on the clone
+                            return {
+                                ...this,
+                                text: async () => xhr.responseText // Still points to original responseText
+                            };
+                        }
                      };
-                     (async () => { await parseAndProcessQuotationResponse(simulatedResponse); })();
+                     // Use async immediately invoked function expression (IIFE) to handle the async call
+                     (async () => {
+                         try {
+                              await parseAndProcessQuotationResponse(simulatedResponse);
+                         } catch(e) {
+                              console.error(`[${SCRIPT_NAME}] Error inside XHR onreadystatechange handler for Quotation:`, e);
+                         }
+                     })();
                 }
-                if (originalOnReadyStateChange) originalOnReadyStateChange.apply(this, arguments);
+
+                // Call the original onreadystatechange handler if it existed
+                if (originalOnReadyStateChange) {
+                     // Use apply to maintain correct context and arguments
+                     originalOnReadyStateChange.apply(xhr, arguments);
+                }
             };
-        } else {
-             xhr.onreadystatechange = originalOnReadyStateChange;
         }
+        // Always call the original send method
         originalXhrSend.apply(this, arguments);
     };
     // --- End Interception Logic ---
 
 
     // --- Initialize ---
-    console.log(`[${SCRIPT_NAME}] v${GM_info.script.version} loaded (runs @ document-idle, dynamic token, polling). Monitoring Quotation & CAFR API.`);
+    console.log(`[${SCRIPT_NAME}] v${GM_info.script.version} loaded (runs @ document-idle, dynamic token, polling, CSS popup). Monitoring Quotation & CAFR API.`);
     if (!GOOGLE_SCRIPT_URL || GOOGLE_SCRIPT_URL === 'PASTE_YOUR_WEB_APP_URL_HERE') {
         GM_notification({ title: SCRIPT_NAME + " WARNING", text: `v${GM_info.script.version}: Google Script URL is missing!`, timeout: 10000 });
     } else {
-         GM_notification({ title: SCRIPT_NAME, text: `v${GM_info.script.version} Loaded. Ready.`, timeout: 3000 });
+         // Don't use GM_notification for successful load if we have the CSS popup
+         // GM_notification({ title: SCRIPT_NAME, text: `v${GM_info.script.version} Loaded. Ready.`, timeout: 3000 });
+         console.log(`[${SCRIPT_NAME}] Ready. Google Script URL is set.`);
     }
 
     // Start the polling mechanism
