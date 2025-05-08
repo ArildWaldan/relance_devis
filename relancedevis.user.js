@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Sur-mesure Scraper
 // @namespace    http://tampermonkey.net/
-// @version      5.1
-// @description  Intercepts Quotation & CAFR requests. Captures token from CAFR, uses polling to trigger customer detail fetch after Quotation, sends data (with IMAGE formula) to Sheet, shows success popup.
+// @version      5.3
+// @description  Intercepts Quotation & CAFR. Captures token, uses polling for customer details, sends data (with IMAGE formula & QuotationID for de-duplication) to Sheet, shows success/duplicate/loading popups.
 // @match        https://squareclock-internal-sqc-production.k8s.ap.digikfplc.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
@@ -19,13 +19,12 @@
 
     const SCRIPT_NAME = 'Scraper';
     // !!! IMPORTANT: PASTE YOUR GOOGLE APPS SCRIPT WEB APP URL HERE !!!
-    const GOOGLE_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwpQ-MemAMmvty7od4pVp4S4rJ8Uj0XFur9-QZ-lSYMBlr23p8StyHzWLzzPVhm5LOE/exec';
+    const GOOGLE_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwpQ-MemAMmvty7od4pVp4S4rJ8Uj0XFur9-QZ-lSYMBlr23p8StyHzWLzzPVhm5LOE/exec'; // REPLACE WITH YOUR URL
     // !!! IMPORTANT: PASTE YOUR GOOGLE APPS SCRIPT WEB APP URL HERE !!!
 
-    // Define API types
     const API_TYPES = {
         QUOTATION: 'Quotation',
-        CAFR: 'CAFR' // Used for token capture and logging
+        CAFR: 'CAFR'
     };
     const TARGETS = [
         { name: API_TYPES.QUOTATION, url_pattern: '/api/carpentry/Order/Quotation?id=' },
@@ -33,15 +32,14 @@
     ];
     const CAFR_API_BASE = 'https://api.kingfisher.com/colleague/v2/customers/CAFR';
 
-    // --- Global variables ---
-    let latestAuthToken = null; // Stores the latest captured Authorization token
-    let pendingCafrData = null; // Stores { customerIdClean, quotationData, vendeurId } for the poller
-    let isProcessingCafr = false; // Flag to prevent multiple simultaneous CAFR calls by the poller
-    const POLLING_INTERVAL_MS = 500; // Check every 500ms
+    let latestAuthToken = null;
+    let pendingCafrData = null; // Stores { customerIdClean, quotationData, vendeurId, quotationId }
+    let isProcessingCafr = false;
+    const POLLING_INTERVAL_MS = 500;
     let pollingIntervalId = null;
-    let successPopupTimeoutId = null; // To manage the popup timer
+    let successPopupTimeoutId = null;
+    let loadingPopupElement = null; // For the "Envoi du devis..." popup
 
-    // --- CSS Styling for Success Popup ---
     GM_addStyle(`
         #gm-scraper-success-popup {
             position: fixed;
@@ -53,10 +51,10 @@
             padding: 12px 18px;
             border-radius: 5px;
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-            z-index: 99999; /* Ensure it's on top */
+            z-index: 99999;
             font-family: sans-serif;
             font-size: 18px;
-            opacity: 0; /* Start hidden */
+            opacity: 0;
             visibility: hidden;
             transition: opacity 0.4s ease-in-out, visibility 0.4s ease-in-out;
         }
@@ -64,11 +62,64 @@
             opacity: 1;
             visibility: visible;
         }
+        #gm-scraper-success-popup.duplicate { /* Style for duplicate message */
+            background-color: #fcf8e3; /* Light yellow */
+            color: #8a6d3b; /* Dark yellow/brown */
+            border-color: #faebcc;
+        }
+        #gm-scraper-loading-popup {
+            position: fixed;
+            bottom: 20px;
+            right: 20px; /* Positioned on the left */
+            background-color: #e0e0e0; /* Light greyish blue */
+            color: #333; /* Dark grey text */
+            border: 1px solid #cccccc;
+            padding: 12px 18px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            z-index: 99998; /* Below success popup if they ever overlap */
+            font-family: sans-serif;
+            font-size: 18px;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.4s ease-in-out, visibility 0.4s ease-in-out;
+        }
+        #gm-scraper-loading-popup.visible {
+            opacity: 1;
+            visibility: visible;
+        }
     `);
 
-    // --- Success Notification Popup Logic ---
-    function showSuccessPopup(message, duration = 6000) {
-        // Remove existing popup and clear its timer if present
+    function showLoadingPopup(message = "Envoi du devis en cours...") {
+        hideLoadingPopup(); // Clear any existing loading popup first
+
+        loadingPopupElement = document.createElement('div');
+        loadingPopupElement.id = 'gm-scraper-loading-popup';
+        loadingPopupElement.textContent = message;
+        document.body.appendChild(loadingPopupElement);
+
+        setTimeout(() => { // Allow DOM update before triggering transition
+            if (loadingPopupElement) loadingPopupElement.classList.add('visible');
+        }, 10);
+    }
+
+    function hideLoadingPopup() {
+        if (loadingPopupElement) {
+            loadingPopupElement.classList.remove('visible');
+            const popupToRemove = loadingPopupElement; // Capture in closure
+            setTimeout(() => {
+                if (popupToRemove && popupToRemove.parentNode) {
+                    popupToRemove.parentNode.removeChild(popupToRemove);
+                }
+                if (loadingPopupElement === popupToRemove) { // Only nullify if it's the same one
+                    loadingPopupElement = null;
+                }
+            }, 400); // Match transition duration
+        }
+    }
+
+
+    function showSuccessPopup(message, duration = 6000, isDuplicate = false) {
         const existingPopup = document.getElementById('gm-scraper-success-popup');
         if (existingPopup) {
             existingPopup.remove();
@@ -77,42 +128,41 @@
             clearTimeout(successPopupTimeoutId);
         }
 
-        // Create new popup element
         const popup = document.createElement('div');
         popup.id = 'gm-scraper-success-popup';
         popup.textContent = message;
+        if (isDuplicate) {
+            popup.classList.add('duplicate');
+        }
         document.body.appendChild(popup);
 
-        // Trigger fade-in (slight delay ensures transition applies)
         setTimeout(() => {
             popup.classList.add('visible');
-        }, 10); // Small delay
+        }, 10);
 
-        // Set timer to fade-out and remove
         successPopupTimeoutId = setTimeout(() => {
             popup.classList.remove('visible');
-            // Remove the element after the fade-out transition completes
             setTimeout(() => {
                 if (document.getElementById('gm-scraper-success-popup') === popup) {
                      popup.remove();
                 }
-            }, 400); // Must match the transition duration in CSS
+            }, 400);
         }, duration);
     }
 
-
-    // --- Google Sheet Communication ---
     function sendDataToSheet(payload) {
         if (!payload) {
             console.warn(`[${SCRIPT_NAME}] No data payload provided to sendDataToSheet.`);
+            hideLoadingPopup(); // Hide loading on abort
             return;
         }
-        if (!GOOGLE_SCRIPT_URL || GOOGLE_SCRIPT_URL === 'PASTE_YOUR_WEB_APP_URL_HERE') {
+        if (!GOOGLE_SCRIPT_URL || GOOGLE_SCRIPT_URL.includes('PASTE_YOUR')) {
              console.error(`[${SCRIPT_NAME}] Google Apps Script URL is not set! Cannot send data.`);
+             hideLoadingPopup(); // Hide loading on abort
              GM_notification({ title: SCRIPT_NAME + " Error", text: "Google Apps Script URL is missing.", timeout: 10000 });
              return;
         }
-        console.log(`[${SCRIPT_NAME}] Sending structured data to Google Sheet...`, payload);
+        console.log(`[${SCRIPT_NAME}] Sending structured data to Google Sheet (Quotation ID: ${payload.QuotationId})...`, payload);
         GM_xmlhttpRequest({
             method: "POST",
             url: GOOGLE_SCRIPT_URL,
@@ -120,6 +170,7 @@
             headers: { "Content-Type": "application/json" },
             timeout: 30000,
             onload: function(response) {
+                hideLoadingPopup(); // Hide loading before showing success/error
                 try {
                     const responseText = response.responseText.trim();
                     if (!responseText) {
@@ -130,10 +181,10 @@
                     const respData = JSON.parse(responseText);
                     if (response.status === 200 && respData.status === 'success') {
                         console.log(`[${SCRIPT_NAME}] Successfully sent data to Google Sheet.`);
-                        // *** SHOW THE SUCCESS POPUP HERE ***
                         showSuccessPopup("Devis bien envoyé à l'application de relance");
-                        // Optional: Keep GM_notification as a backup or for more detailed info?
-                        // GM_notification({ title: SCRIPT_NAME, text: `Data sent successfully for ${payload.NomClient || 'N/A'}`, timeout: 4000 });
+                    } else if (response.status === 200 && respData.status === 'duplicate') {
+                        console.log(`[${SCRIPT_NAME}] Data already exists in Google Sheet (duplicate). Quotation ID: ${payload.QuotationId}`);
+                        showSuccessPopup("Ce devis est déjà enregistré.", 6000, true); // isDuplicate = true
                     } else {
                         console.error(`[${SCRIPT_NAME}] Error sending data. Status: ${response.status}. Response:`, respData.message || response.responseText);
                         GM_notification({ title: SCRIPT_NAME + " Error", text: `Sheet Error: ${respData.message || 'Check console.'}`, timeout: 10000 });
@@ -144,17 +195,18 @@
                 }
             },
             onerror: function(response) {
-                console.error(`[${SCRIPT_NAME}] Network error sending data to Google Sheet. Status: ${response.status}. Response:`, response.responseText);
-                 GM_notification({ title: SCRIPT_NAME + " Network Error", text: `Network error sending data. Check console.`, timeout: 10000 });
+                hideLoadingPopup(); // Hide loading on error
+                console.error(`[${SCRIPT_NAME}] Network error sending data. Status: ${response.status}. Resp:`, response.responseText);
+                 GM_notification({ title: SCRIPT_NAME + " Network Error", text: `Network error sending. Check console.`, timeout: 10000 });
             },
             ontimeout: function() {
+                hideLoadingPopup(); // Hide loading on timeout
                 console.error(`[${SCRIPT_NAME}] Timeout sending data to Google Sheet.`);
                  GM_notification({ title: SCRIPT_NAME + " Timeout", text: `Timeout sending data.`, timeout: 10000 });
             }
         });
     }
 
-    // --- Helper: Format Date ---
     function formatDate(isoString) {
         if (!isoString) return '';
         try {
@@ -169,31 +221,32 @@
         }
     }
 
-    // --- Structure and Send Final Data ---
-    function structureAndSendData(quotationData, customerAttributes, vendeurId) {
+    // Added quotationId parameter
+    function structureAndSendData(quotationData, customerAttributes, vendeurId, quotationId) {
         try {
-            console.log(`[${SCRIPT_NAME}] Structuring combined data...`);
+            console.log(`[${SCRIPT_NAME}] Structuring combined data (Quotation ID: ${quotationId})...`);
             let allProductNames = [];
             let firstProductIcon = '';
             let totalDiscountPriceSum = 0;
 
             if (quotationData && Array.isArray(quotationData.categories)) {
-                for (const category of quotationData.categories) {
+                quotationData.categories.forEach(category => {
                     if (category && Array.isArray(category.products)) {
-                        for (const product of category.products) {
+                        category.products.forEach(product => {
                             if (product) {
                                 allProductNames.push(product.nameFr || product.nameEn || 'Unknown Product');
                                 if (firstProductIcon === '' && product.icon) firstProductIcon = product.icon;
                                 totalDiscountPriceSum += (parseFloat(product.totalDiscountPv) || 0);
-                             }
-                        }
+                            }
+                        });
                     }
-                }
+                });
             } else {
                 console.warn(`[${SCRIPT_NAME}] Quotation data or categories array missing/invalid during structuring.`);
             }
 
             const structuredData = {
+                QuotationId: quotationId || '', // Added Quotation ID
                 Date: formatDate(quotationData?.creationDate),
                 NomClient: customerAttributes ? `${customerAttributes.givenName || ''} ${customerAttributes.familyName || ''}`.trim() : 'N/A',
                 Telephone: customerAttributes ? (customerAttributes.mobileNumber || customerAttributes.phoneNumber || '') : '',
@@ -202,174 +255,150 @@
                 PrixTTC: quotationData?.totalPV ?? null,
                 PrixRemise: totalDiscountPriceSum,
                 Produits: allProductNames.join(', '),
-                // Keep image URL simple, let Sheets handle =IMAGE()
-                Image: firstProductIcon,
+                Image: firstProductIcon, // GAS will wrap this with =IMAGE()
                 Vendeur: vendeurId || ''
             };
-            sendDataToSheet(structuredData); // This function now triggers the popup on success
+            sendDataToSheet(structuredData);
         } catch(e) {
-             console.error(`[${SCRIPT_NAME}] Error during final data structuring or sending:`, e);
+             console.error(`[${SCRIPT_NAME}] Error during final data structuring or sending (Quotation ID: ${quotationId}):`, e);
+             hideLoadingPopup(); // Hide loading if this critical step fails before sendDataToSheet
              GM_notification({ title: SCRIPT_NAME + " Error", text: "Error structuring data. Check console.", timeout: 6000 });
         }
     }
 
-    // --- Fetch Specific Customer Details (Uses captured token) ---
-    // Called by the polling mechanism
-    function fetchCustomerDetails(customerId, quotationData, vendeurId) {
-        // --- TOKEN CHECK ---
+    // Added quotationId parameter
+    function fetchCustomerDetails(customerId, quotationData, vendeurId, quotationId) {
         if (!latestAuthToken) {
-             console.error(`[${SCRIPT_NAME}] Cannot fetch customer details: Authorization token has not been captured from any page CAFR request yet.`);
-             GM_notification({ title: SCRIPT_NAME + " Auth Error", text: "Auth token not captured. Customer details skipped.", timeout: 8000 });
-             isProcessingCafr = false; // Reset flag
-             structureAndSendData(quotationData, null, vendeurId); // Send partial data
+             console.error(`[${SCRIPT_NAME}] Cannot fetch CAFR: Auth token not captured. Quotation ID: ${quotationId}`);
+             GM_notification({ title: SCRIPT_NAME + " Auth Error", text: "Auth token missing. Customer details skipped.", timeout: 8000 });
+             isProcessingCafr = false;
+             structureAndSendData(quotationData, null, vendeurId, quotationId); // Send partial with quotationId
              return;
         }
-        // --- END TOKEN CHECK ---
 
-        console.log(`[${SCRIPT_NAME}] Polling function triggered fetch for customer: ${customerId} using captured token.`);
+        console.log(`[${SCRIPT_NAME}] Polling fetch for customer: ${customerId} (Quotation ID: ${quotationId})`);
         const fetchUrl = `${CAFR_API_BASE}?filter[customerNumber]=${encodeURIComponent(customerId)}&page[number]=1&page[size]=1`;
         const headers = {
             'Accept': 'application/json, text/plain, */*',
             'X-Tenant': 'CAFR',
-            'Authorization': latestAuthToken // Use the captured token
+            'Authorization': latestAuthToken
         };
-
-        console.log(`[${SCRIPT_NAME}] Preparing GM_xmlhttpRequest (from poll) for URL: ${fetchUrl}`);
         let requestStartTime = Date.now();
 
-        try {
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: fetchUrl,
-                headers: headers,
-                timeout: 30000,
-                onload: function(response) {
-                    let duration = Date.now() - requestStartTime;
-                    console.log(`[${SCRIPT_NAME}] GM_xmlhttpRequest (poll) - onload triggered after ${duration}ms. Status: ${response.status}`);
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: fetchUrl,
+            headers: headers,
+            timeout: 30000,
+            onload: function(response) {
+                let duration = Date.now() - requestStartTime;
+                console.log(`[${SCRIPT_NAME}] CAFR fetch onload (poll) after ${duration}ms. Status: ${response.status}. Quotation ID: ${quotationId}`);
+                try {
                     if (response.status >= 200 && response.status < 300) {
-                        console.log(`[${SCRIPT_NAME}] Successfully fetched CAFR details (poll - Status: ${response.status}).`);
-                        try {
-                            const cafrResponseData = JSON.parse(response.responseText);
-                            if (cafrResponseData?.data?.length > 0 && cafrResponseData.data[0].attributes) {
-                                console.log(`[${SCRIPT_NAME}] CAFR details found (poll).`, cafrResponseData.data[0].attributes);
-                                structureAndSendData(quotationData, cafrResponseData.data[0].attributes, vendeurId);
-                            } else {
-                                console.warn(`[${SCRIPT_NAME}] Fetched CAFR data (poll), but structure unexpected or empty. Sending partial data. Resp:`, cafrResponseData);
-                                GM_notification({ title: SCRIPT_NAME + " Warning", text: `CAFR data missing/invalid for ${customerId}. Partial sent.`, timeout: 8000 });
-                                structureAndSendData(quotationData, null, vendeurId);
-                            }
-                        } catch (e) {
-                            console.error(`[${SCRIPT_NAME}] Error parsing fetched CAFR JSON (poll):`, e, response.responseText);
-                            GM_notification({ title: SCRIPT_NAME + " Error", text: `CAFR parse error for ${customerId}. Partial sent.`, timeout: 8000 });
-                            structureAndSendData(quotationData, null, vendeurId);
+                        const cafrResponseData = JSON.parse(response.responseText);
+                        if (cafrResponseData?.data?.length > 0 && cafrResponseData.data[0].attributes) {
+                            console.log(`[${SCRIPT_NAME}] CAFR details found (poll).`, cafrResponseData.data[0].attributes);
+                            structureAndSendData(quotationData, cafrResponseData.data[0].attributes, vendeurId, quotationId);
+                        } else {
+                            console.warn(`[${SCRIPT_NAME}] CAFR data (poll) structure unexpected. Sending partial. Resp:`, cafrResponseData);
+                            structureAndSendData(quotationData, null, vendeurId, quotationId);
                         }
                     } else {
-                         if (response.status === 401 || response.status === 403) {
-                             console.error(`[${SCRIPT_NAME}] Authentication Error (${response.status}) fetching CAFR (poll). Captured Token might be invalid/expired. Resp:`, response.responseText);
-                             GM_notification({ title: SCRIPT_NAME + " CAFR Auth Error", text: `Auth Error ${response.status} (poll). Check token/console.`, timeout: 10000 });
-                         } else {
-                            console.error(`[${SCRIPT_NAME}] Error fetching CAFR details (poll - onload). Status: ${response.status}. Resp:`, response.responseText);
-                             GM_notification({ title: SCRIPT_NAME + " CAFR Error", text: `Error ${response.status} fetching CAFR (poll). Partial sent. Check console.`, timeout: 10000 });
-                        }
-                        structureAndSendData(quotationData, null, vendeurId); // Send partial on any non-2xx status
+                        if (response.status === 401 || response.status === 403) console.error(`[${SCRIPT_NAME}] CAFR Auth Error (${response.status}) (poll). Token might be invalid. Resp:`, response.responseText);
+                        else console.error(`[${SCRIPT_NAME}] Error fetching CAFR (poll). Status: ${response.status}. Resp:`, response.responseText);
+                        structureAndSendData(quotationData, null, vendeurId, quotationId);
                     }
-                    isProcessingCafr = false; // Reset flag on completion
-                },
-                onerror: function(response) {
-                    let duration = Date.now() - requestStartTime;
-                    console.error(`[${SCRIPT_NAME}] GM_xmlhttpRequest (poll) - onerror triggered after ${duration}ms. Status: ${response.status}. Final URL: ${response.finalUrl}`, response);
-                    GM_notification({ title: SCRIPT_NAME + " CAFR Network Error", text: `Network error fetching CAFR (poll). Partial sent. Check console.`, timeout: 10000 });
-                    isProcessingCafr = false; // Reset flag on error
-                    structureAndSendData(quotationData, null, vendeurId);
-                 },
-                ontimeout: function() {
-                    let duration = Date.now() - requestStartTime;
-                    console.error(`[${SCRIPT_NAME}] GM_xmlhttpRequest (poll) - ontimeout triggered after ${duration}ms.`);
-                    GM_notification({ title: SCRIPT_NAME + " CAFR Timeout", text: `Timeout fetching CAFR (poll). Partial sent.`, timeout: 10000 });
-                    isProcessingCafr = false; // Reset flag on error
-                    structureAndSendData(quotationData, null, vendeurId);
-                },
-                onabort: function(response) {
-                     let duration = Date.now() - requestStartTime;
-                     console.error(`[${SCRIPT_NAME}] GM_xmlhttpRequest (poll) - onabort triggered after ${duration}ms.`, response);
-                     GM_notification({ title: SCRIPT_NAME + " CAFR Aborted", text: `Request aborted (poll). Partial sent.`, timeout: 10000 });
-                     isProcessingCafr = false; // Reset flag on error
-                     structureAndSendData(quotationData, null, vendeurId);
+                } catch (e) {
+                    console.error(`[${SCRIPT_NAME}] Error parsing CAFR JSON (poll):`, e, response.responseText);
+                    structureAndSendData(quotationData, null, vendeurId, quotationId);
+                } finally {
+                    isProcessingCafr = false;
                 }
-            });
-            console.log(`[${SCRIPT_NAME}] GM_xmlhttpRequest (poll) function called. Waiting for callback...`);
-        } catch (e) {
-             console.error(`[${SCRIPT_NAME}] Error occurred *during* the call to GM_xmlhttpRequest setup (poll):`, e);
-             GM_notification({ title: SCRIPT_NAME + " Setup Error", text: `Error setting up CAFR request (poll). Check console.`, timeout: 10000 });
-             isProcessingCafr = false; // Reset flag on error
-             structureAndSendData(quotationData, null, vendeurId);
-        }
+            },
+            onerror: function(response) {
+                console.error(`[${SCRIPT_NAME}] CAFR fetch network error (poll). Status: ${response.status}. Quotation ID: ${quotationId}`, response);
+                structureAndSendData(quotationData, null, vendeurId, quotationId);
+                isProcessingCafr = false;
+             },
+            ontimeout: function() {
+                console.error(`[${SCRIPT_NAME}] CAFR fetch timeout (poll). Quotation ID: ${quotationId}`);
+                structureAndSendData(quotationData, null, vendeurId, quotationId);
+                isProcessingCafr = false;
+            },
+            onabort: function(response) {
+                 console.error(`[${SCRIPT_NAME}] CAFR fetch aborted (poll). Quotation ID: ${quotationId}`, response);
+                 structureAndSendData(quotationData, null, vendeurId, quotationId);
+                 isProcessingCafr = false;
+            }
+        });
     }
 
-    // --- Process Initial Quotation Response ---
-    // Stores data for the poller
-    function processQuotationResponse(quotationData) {
+    // Added quotationId parameter
+    function processQuotationResponse(quotationData, quotationId) {
         try {
-            console.log(`[${SCRIPT_NAME}] Processing Quotation response...`);
+            console.log(`[${SCRIPT_NAME}] Processing Quotation response (ID: ${quotationId})...`);
             const customerIdRaw = quotationData?.customerId;
             const vendeurId = quotationData?.creationUserId;
 
             if (!quotationData || typeof quotationData !== 'object' || !quotationData.creationDate) {
-                 console.error(`[${SCRIPT_NAME}] Invalid or incomplete Quotation data received. Aborting processing.`, quotationData);
+                 console.error(`[${SCRIPT_NAME}] Invalid Quotation data (ID: ${quotationId}). Aborting.`, quotationData);
+                 hideLoadingPopup(); // Hide loading on critical error
                  return;
             }
+            if (!quotationId) {
+                 console.warn(`[${SCRIPT_NAME}] Quotation ID missing during processing. De-duplication by ID will fail.`, quotationData);
+            }
+
             if (!customerIdRaw) {
-                console.warn(`[${SCRIPT_NAME}] Quotation response missing 'customerId'. Cannot process for CAFR.`, quotationData);
-                // Sending partial data immediately if customerId is missing
-                 structureAndSendData(quotationData, null, vendeurId);
+                console.warn(`[${SCRIPT_NAME}] Quotation missing 'customerId' (ID: ${quotationId}). Sending partial.`, quotationData);
+                structureAndSendData(quotationData, null, vendeurId, quotationId);
                 return;
             }
             if (!vendeurId) {
-                 console.warn(`[${SCRIPT_NAME}] Quotation response missing 'creationUserId'. Vendeur field will be empty.`, quotationData);
+                 console.warn(`[${SCRIPT_NAME}] Quotation missing 'creationUserId' (ID: ${quotationId}). Vendeur empty.`, quotationData);
             }
 
             const customerIdClean = customerIdRaw.replace(/^SQ_/, '');
 
-            // Store data for the poller, replacing any existing pending data
-             if (!isProcessingCafr) { // Only store if not already processing
-                 console.log(`[${SCRIPT_NAME}] Storing data, ready for CAFR fetch poll: Customer ID ${customerIdClean}`);
-                 pendingCafrData = { customerIdClean, quotationData: JSON.parse(JSON.stringify(quotationData)), vendeurId };
-             } else {
-                 console.warn(`[${SCRIPT_NAME}] Ignoring new Quotation response while previous CAFR fetch is processing. Overwriting pending data.`);
-                 // Overwrite pending data so the *latest* quote is processed next
-                 pendingCafrData = { customerIdClean, quotationData: JSON.parse(JSON.stringify(quotationData)), vendeurId };
-             }
+            const dataToStore = { customerIdClean, quotationData: JSON.parse(JSON.stringify(quotationData)), vendeurId, quotationId };
 
-            console.log(`[${SCRIPT_NAME}] processQuotationResponse function finished (data stored).`);
+            if (!isProcessingCafr) {
+                 console.log(`[${SCRIPT_NAME}] Storing data for CAFR poll: CustID ${customerIdClean}, QuotID ${quotationId}`);
+                 pendingCafrData = dataToStore;
+            } else {
+                 console.warn(`[${SCRIPT_NAME}] Overwriting pending CAFR data due to new Quotation (ID: ${quotationId}) while previous was processing.`);
+                 pendingCafrData = dataToStore;
+            }
+            console.log(`[${SCRIPT_NAME}] processQuotationResponse finished for Quotation ID: ${quotationId}.`);
 
         } catch (e) {
-            console.error(`[${SCRIPT_NAME}] Error processing quotation data:`, e, quotationData);
+            console.error(`[${SCRIPT_NAME}] Error processing quotation data (ID: ${quotationId}):`, e, quotationData);
+            hideLoadingPopup(); // Hide loading on critical error
         }
     }
 
-
-    // --- Polling Function ---
-    // Checks if data is ready and triggers the fetch
     function checkAndProcessPendingCafr() {
         if (pendingCafrData && !isProcessingCafr) {
-            console.log(`[${SCRIPT_NAME}] Poller found pending data. Initiating CAFR fetch.`);
-            isProcessingCafr = true; // Set flag BEFORE calling async function
+            console.log(`[${SCRIPT_NAME}] Poller found pending data. Initiating CAFR fetch for Quotation ID: ${pendingCafrData.quotationId}.`);
+            isProcessingCafr = true;
 
             const dataToProcess = pendingCafrData;
-            pendingCafrData = null; // Clear pending state immediately
+            pendingCafrData = null; // Clear immediately
 
             try {
-                 fetchCustomerDetails(dataToProcess.customerIdClean, dataToProcess.quotationData, dataToProcess.vendeurId);
+                 fetchCustomerDetails(dataToProcess.customerIdClean, dataToProcess.quotationData, dataToProcess.vendeurId, dataToProcess.quotationId);
             } catch(e) {
-                 console.error(`[${SCRIPT_NAME}] Synchronous error calling fetchCustomerDetails from poller:`, e);
-                 isProcessingCafr = false; // Ensure flag is reset if the call itself fails instantly
+                 console.error(`[${SCRIPT_NAME}] Sync error calling fetchCustomerDetails from poller (QuotID: ${dataToProcess.quotationId}):`, e);
+                 isProcessingCafr = false;
+                 if(dataToProcess && dataToProcess.quotationData) {
+                     structureAndSendData(dataToProcess.quotationData, null, dataToProcess.vendeurId, dataToProcess.quotationId);
+                 } else {
+                     hideLoadingPopup(); // If no data to send, ensure loading popup is hidden
+                 }
             }
         }
     }
 
-    // --- Interception Logic ---
-
-    // Helper to check if a URL matches our target API patterns
     function getTargetMatch(url) {
         if (!url || typeof url !== 'string') return null;
         for (const target of TARGETS) {
@@ -380,192 +409,162 @@
         return null;
     }
 
-    // Main function to handle intercepted *Quotation* responses
-    async function parseAndProcessQuotationResponse(response) {
+    function extractQuotationId(url) {
+        if (!url) return null;
+        try {
+            const urlObj = new URL(url);
+            return urlObj.searchParams.get('id');
+        } catch (e) {
+            const match = url.match(/[?&]id=([^&]+)/);
+            if (match && match[1]) {
+                return match[1];
+            }
+            console.warn(`[${SCRIPT_NAME}] Could not extract quotation ID from URL: ${url}`, e);
+            return null;
+        }
+    }
+
+    async function parseAndProcessQuotationResponse(response, quotationId) {
         const url = response.url || (response.responseURL);
-        console.log(`[${SCRIPT_NAME}] Intercepted ${response.ok ? 'OK' : 'Failed'} response for Quotation from: ${url}`);
+        console.log(`[${SCRIPT_NAME}] Intercepted ${response.ok ? 'OK' : 'Failed'} Quotation response (ID: ${quotationId}) from: ${url}`);
         if (!response.ok) {
-             console.warn(`[${SCRIPT_NAME}] Ignoring failed Quotation request (${response.status}).`);
+             console.warn(`[${SCRIPT_NAME}] Ignoring failed Quotation request (${response.status}) (ID: ${quotationId}).`);
+             // Do not show loading popup for failed requests
              return;
         }
+
+        showLoadingPopup("Envoi du devis en cours..."); // Show loading popup as processing starts
+
         try {
             const responseClone = response.clone();
             const text = await responseClone.text();
             if (!text || text.trim() === '') {
-                 console.warn(`[${SCRIPT_NAME}] Quotation Response (${url}) body is empty. Cannot process.`);
+                 console.warn(`[${SCRIPT_NAME}] Quotation Response (ID: ${quotationId}, URL: ${url}) body is empty.`);
+                 hideLoadingPopup(); // Hide if body is empty
                  return;
             }
             const jsonData = JSON.parse(text);
-            processQuotationResponse(jsonData); // Stores data for poller
+            processQuotationResponse(jsonData, quotationId);
         } catch (err) {
-             const errorText = await response.clone().text(); // Use clone here too
+             hideLoadingPopup(); // Hide loading on parsing error
+             const errorText = await response.clone().text().catch(() => "Could not get error text");
              if (err instanceof SyntaxError) {
-                 console.error(`[${SCRIPT_NAME}] Quotation Response (${url}) is not valid JSON. Snippet:`, errorText.substring(0, 500), err);
+                 console.error(`[${SCRIPT_NAME}] Quotation Response (ID: ${quotationId}, URL: ${url}) not valid JSON. Snippet:`, errorText.substring(0, 200), err);
              } else {
-                 console.error(`[${SCRIPT_NAME}] Error reading/processing Quotation Response body (${url}):`, err, errorText);
+                 console.error(`[${SCRIPT_NAME}] Error reading Quotation Response body (ID: ${quotationId}, URL: ${url}):`, err, errorText.substring(0,200));
              }
         }
     }
 
-    // --- Intercept fetch (Handles Token Capture and Quotation Response) ---
     const originalFetch = unsafeWindow.fetch;
     unsafeWindow.fetch = function(input, init) {
         const url = (typeof input === 'string') ? input : input.url;
         const target = getTargetMatch(url);
+        let currentQuotationId = null;
 
-        // --- Token Capture Logic (Fetch) ---
         if (target && target.name === API_TYPES.CAFR) {
-            //console.log(`[${SCRIPT_NAME}] Detected page's ${target.name} fetch request (for token capture):`, url); // Can be noisy
-            try {
-                let headers = init?.headers;
-                let currentToken = null;
-                if (headers) {
-                    if (headers instanceof Headers) {
-                        currentToken = headers.get('Authorization');
-                    } else if (typeof headers === 'object') {
-                        const authKey = Object.keys(headers).find(k => k.toLowerCase() === 'authorization');
-                        if (authKey) currentToken = headers[authKey];
+            if (init && init.headers) {
+                const headers = new Headers(init.headers); // Normalize headers
+                const token = headers.get('Authorization');
+                if (token && token.toLowerCase().startsWith('bearer ')) {
+                    if (latestAuthToken !== token) {
+                        console.log(`[${SCRIPT_NAME}] Captured/Updated Auth Token via fetch for CAFR.`);
+                        latestAuthToken = token;
                     }
+                } else if (token) {
+                    console.warn(`[${SCRIPT_NAME}] Non-Bearer Authorization header found for CAFR (fetch): ${token.substring(0,10)}...`);
                 }
-                if (currentToken && currentToken.toLowerCase().startsWith('bearer ')) {
-                    if (latestAuthToken !== currentToken) {
-                         console.log(`[${SCRIPT_NAME}] Captured/Updated Auth Token via fetch request to CAFR.`);
-                         latestAuthToken = currentToken;
-                    }
-                } else if (currentToken) {
-                    console.warn(`[${SCRIPT_NAME}] Found Authorization header in CAFR fetch, but it doesn't start with 'Bearer '.`, currentToken.substring(0, 15)+"...");
-                }
-            } catch (e) {
-                console.error(`[${SCRIPT_NAME}] Error extracting headers from CAFR fetch init:`, e);
             }
-        }
-        // --- End Token Capture Logic (Fetch) ---
-         else if (target && target.name === API_TYPES.QUOTATION) {
-             console.log(`[${SCRIPT_NAME}] Detected page's ${target.name} fetch request:`, url);
+        } else if (target && target.name === API_TYPES.QUOTATION) {
+            currentQuotationId = extractQuotationId(url);
+            console.log(`[${SCRIPT_NAME}] Fetch: ${target.name} (ID: ${currentQuotationId || 'N/A'}): ${url.substring(0,100)}...`);
         }
 
-        // Execute the original fetch
         const promise = originalFetch.apply(this, arguments);
 
-        // --- Quotation Response Handling (Fetch) ---
         if (target && target.name === API_TYPES.QUOTATION) {
             promise.then(response => {
-                 const responseClone = response.clone(); // Clone it *once* here
-                 (async () => { await parseAndProcessQuotationResponse(responseClone); })();
-                 return response; // Return original response to the page
+                 const responseClone = response.clone();
+                 (async () => { await parseAndProcessQuotationResponse(responseClone, currentQuotationId); })();
+                 return response;
             }).catch(error => {
-                console.error(`[${SCRIPT_NAME}] Network/Fetch Error intercepting ${target.name} (${url}):`, error);
+                // If fetch itself fails (network error), the loading popup might not have been shown yet, or might need to be hidden if shown by a previous attempt.
+                // For simplicity, error logging is primary here. The loading popup is more tied to *successful response processing*.
+                console.error(`[${SCRIPT_NAME}] Network/Fetch Error intercepting ${target.name} (ID: ${currentQuotationId}, URL: ${url}):`, error);
             });
         }
-        // --- End Quotation Response Handling (Fetch) ---
-
         return promise;
     };
 
-    // --- Intercept XMLHttpRequest (Handles Token Capture and Quotation Response) ---
     const originalXhrOpen = unsafeWindow.XMLHttpRequest.prototype.open;
     const originalXhrSend = unsafeWindow.XMLHttpRequest.prototype.send;
     const originalSetRequestHeader = unsafeWindow.XMLHttpRequest.prototype.setRequestHeader;
 
-    // Store the original request header function per instance if needed
-    // (though applying globally is usually fine for this purpose)
-    // unsafeWindow.XMLHttpRequest.prototype._originalSetRequestHeader = originalSetRequestHeader;
-
-    // Intercept setRequestHeader for Token Capture
     unsafeWindow.XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
-        // Check if it's a CAFR request (target identified in 'open') and the Authorization header
         if (this._target && this._target.name === API_TYPES.CAFR && header.toLowerCase() === 'authorization') {
              if (value && value.toLowerCase().startsWith('bearer ')) {
                 if (latestAuthToken !== value) {
-                    console.log(`[${SCRIPT_NAME}] Captured/Updated Auth Token via XHR setRequestHeader for CAFR.`);
-                    latestAuthToken = value; // Store token globally
+                    console.log(`[${SCRIPT_NAME}] Captured/Updated Auth Token via XHR for CAFR.`);
+                    latestAuthToken = value;
                 }
              } else if (value) {
-                 console.warn(`[${SCRIPT_NAME}] Found Authorization header in CAFR XHR, but doesn't start with 'Bearer '.`, value.substring(0, 15)+"...");
+                console.warn(`[${SCRIPT_NAME}] Non-Bearer Authorization header found for CAFR (XHR): ${value.substring(0,10)}...`);
              }
         }
-        // Always call the original method using apply to maintain context
         originalSetRequestHeader.apply(this, arguments);
     };
 
-    // Intercept open to identify target API
     unsafeWindow.XMLHttpRequest.prototype.open = function(method, url) {
         this._requestURL = url;
-        this._target = getTargetMatch(url); // Identify if it's CAFR or Quotation
+        this._target = getTargetMatch(url);
+        this._quotationId = null;
+
         if (this._target) {
              if (this._target.name === API_TYPES.QUOTATION) {
-                console.log(`[${SCRIPT_NAME}] Detected page's ${this._target.name} XHR request (open):`, url);
-            } // else { // Can log CAFR open too, but might be noisy
-              // console.log(`[${SCRIPT_NAME}] Detected page's ${this._target.name} XHR request (open - for token):`, url);
-            // }
+                this._quotationId = extractQuotationId(url);
+                console.log(`[${SCRIPT_NAME}] XHR Open: ${this._target.name} (ID: ${this._quotationId || 'N/A'}): ${url.substring(0,100)}...`);
+            }
         }
         originalXhrOpen.apply(this, arguments);
     };
 
-    // Intercept send to attach Quotation response handler
     unsafeWindow.XMLHttpRequest.prototype.send = function() {
         const xhr = this;
-
-        // Only attach listener if it's a Quotation request and we haven't already attached one
         if (xhr._target && xhr._target.name === API_TYPES.QUOTATION && !xhr._hasScraperListener) {
              const originalOnReadyStateChange = xhr.onreadystatechange;
-             xhr._hasScraperListener = true; // Mark that we've added our listener
+             xhr._hasScraperListener = true;
 
              xhr.onreadystatechange = function() {
-                // Process only when request is complete (readyState 4) and it's our target
                 if (xhr.readyState === 4 && xhr._target && xhr._target.name === API_TYPES.QUOTATION) {
-                     // Create a fetch-like response object for consistency
                      const simulatedResponse = {
                         ok: xhr.status >= 200 && xhr.status < 300,
                         status: xhr.status,
                         statusText: xhr.statusText,
-                        url: xhr.responseURL || xhr._requestURL, // Use responseURL if available
-                        text: async () => xhr.responseText, // Make text() async like fetch
-                        // Simple clone for our purposes (doesn't need full stream cloning)
-                        clone: function() {
-                            // Return a new object with the same properties
-                            // Important: text() needs to be callable again on the clone
-                            return {
-                                ...this,
-                                text: async () => xhr.responseText // Still points to original responseText
-                            };
-                        }
+                        url: xhr.responseURL || xhr._requestURL,
+                        text: async () => xhr.responseText,
+                        clone: function() { return { ...this, text: async () => xhr.responseText }; } // Simple clone for text()
                      };
-                     // Use async immediately invoked function expression (IIFE) to handle the async call
                      (async () => {
-                         try {
-                              await parseAndProcessQuotationResponse(simulatedResponse);
-                         } catch(e) {
-                              console.error(`[${SCRIPT_NAME}] Error inside XHR onreadystatechange handler for Quotation:`, e);
-                         }
+                         try { await parseAndProcessQuotationResponse(simulatedResponse, xhr._quotationId); }
+                         catch(e) { console.error(`[${SCRIPT_NAME}] Error in XHR onreadystatechange for Quotation (ID: ${xhr._quotationId}):`, e); }
                      })();
                 }
-
-                // Call the original onreadystatechange handler if it existed
                 if (originalOnReadyStateChange) {
-                     // Use apply to maintain correct context and arguments
                      originalOnReadyStateChange.apply(xhr, arguments);
                 }
             };
         }
-        // Always call the original send method
         originalXhrSend.apply(this, arguments);
     };
-    // --- End Interception Logic ---
 
-
-    // --- Initialize ---
-    console.log(`[${SCRIPT_NAME}] v${GM_info.script.version} loaded (runs @ document-idle, dynamic token, polling, CSS popup). Monitoring Quotation & CAFR API.`);
-    if (!GOOGLE_SCRIPT_URL || GOOGLE_SCRIPT_URL === 'PASTE_YOUR_WEB_APP_URL_HERE') {
-        GM_notification({ title: SCRIPT_NAME + " WARNING", text: `v${GM_info.script.version}: Google Script URL is missing!`, timeout: 10000 });
+    console.log(`[${SCRIPT_NAME}] v${GM_info.script.version} loaded. Monitoring Quotation & CAFR.`);
+    if (!GOOGLE_SCRIPT_URL || GOOGLE_SCRIPT_URL.includes('PASTE_YOUR')) {
+        GM_notification({ title: SCRIPT_NAME + " WARNING", text: `v${GM_info.script.version}: Google Script URL missing!`, timeout: 10000 });
     } else {
-         // Don't use GM_notification for successful load if we have the CSS popup
-         // GM_notification({ title: SCRIPT_NAME, text: `v${GM_info.script.version} Loaded. Ready.`, timeout: 3000 });
          console.log(`[${SCRIPT_NAME}] Ready. Google Script URL is set.`);
     }
 
-    // Start the polling mechanism
     pollingIntervalId = setInterval(checkAndProcessPendingCafr, POLLING_INTERVAL_MS);
     console.log(`[${SCRIPT_NAME}] Polling started (Interval: ${POLLING_INTERVAL_MS}ms).`);
 
-})(); // End of Userscript IIFE
+})();
